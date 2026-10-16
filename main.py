@@ -32,19 +32,21 @@ def setup_logging():
 
 
 def scrape(max_pages=None):
-    """Walk the paginated catalogue and return raw book dicts."""
-    books, url, page = [], config.START_URL, 0
+    """Walk the paginated catalogue. Returns (raw book dicts, pages scraped, complete).
+    complete is True only if we reached the last page (no next-page link)."""
+    books, url, page, complete = [], config.START_URL, 0, False
     with Fetcher() as fetcher:
         while url and (max_pages is None or page < max_pages):
-            page += 1
             html = fetcher.get(url)
             if html is None:
-                log.error("Stopping at page %d: could not fetch %s", page, url)
+                log.error("Stopping at page %d: could not fetch %s", page + 1, url)
                 break
+            page += 1
             page_books, url = parse_listing(html, url)
             books.extend(page_books)
             log.info("Page %d: %d books (total %d)", page, len(page_books), len(books))
-    return books
+            complete = url is None
+    return books, page, complete
 
 
 def simulate_changes(df, n=5):
@@ -69,8 +71,9 @@ def main():
     setup_logging()
     log.info("Starting scrape of %s", config.BASE_URL)
 
-    raw = scrape(args.max_pages)
-    df = clean_books(raw, scraped_at=datetime.now())
+    started_at = datetime.now()
+    raw, pages, complete = scrape(args.max_pages)
+    df = clean_books(raw, scraped_at=started_at)
     if df.empty:
         log.error("No books scraped; nothing to save")
         return 1
@@ -79,11 +82,15 @@ def main():
 
     conn = connect()
     try:
-        log.info("Saved %d rows to %s", save_run(conn, df), config.DB_PATH)
+        run_id = save_run(
+            conn, df, started_at=started_at, pages=pages, complete=complete,
+            simulated=args.simulate_changes, max_pages=args.max_pages,
+        )
+        log.info("Saved run %d (%d books) to %s", run_id, len(df), config.DB_PATH)
         if not args.no_csv:
             log.info("Exported CSV to %s", export_csv(df))
 
-        report = build_report(conn)
+        report = build_report(conn, run_id)
     finally:
         conn.close()
 
@@ -92,8 +99,13 @@ def main():
 
     if args.email:
         changes = len(report["increases"]) + len(report["drops"])
-        subject = f"Book Price Report: {report['count']} books, {changes} price changes"
+        tags = ("[INCOMPLETE] " if not complete else "") + ("[SIMULATED] " if args.simulate_changes else "")
+        subject = f"{tags}Book Price Report: {report['count']} books, {changes} price changes"
         send_report(subject, text, format_html(report))
+
+    if not complete:
+        log.warning("Incomplete run (%d pages); saved but not usable as a baseline", pages)
+        return 2
     return 0
 
 
