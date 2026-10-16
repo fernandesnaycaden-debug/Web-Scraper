@@ -24,11 +24,33 @@ pytest                              # offline tests against a saved HTML page
 ```
 
 Outputs:
-- `data/scraper.db`: SQLite tables `books` (one row per book) and `price_history` (one row per book per run)
+- `data/scraper.db`: SQLite tables
+  - `books`: one row per book
+  - `runs`: one row per run: `started_at`, `finished_at`, `pages`, `books`, `complete` (reached the last page), `simulated` (`--simulate-changes`), `max_pages`
+  - `price_history`: one row per book per run, linked to its run by `run_id`
 - `data/exports/books_YYYY-MM-DD.csv`: a snapshot of the latest run
 - `logs/scraper.log`: the run log
 
 > books.toscrape.com never changes its prices, so the change report will be empty on real runs. Use `--simulate-changes` on a second run to see increases and drops.
+
+## Run tracking
+
+Every run is saved, and its `runs` row records what kind of run it was. The price-change report compares the current run against the **latest earlier run that was complete and not simulated**. Test runs (`--max-pages`), partial runs (a page failed to fetch) and simulated runs never become the comparison baseline, so they can't produce false "removed"/"new" books or fake price changes later on.
+
+- **Incomplete run:** price increases and drops are reported for books seen in both runs. The new/removed lists are skipped, with a warning.
+- **Suspect drop:** if a complete run finds more than 10% fewer books than the baseline (`SUSPECT_DROP_RATIO` in `config.py`), the removed list is skipped and a warning says the site layout may have changed.
+- **Simulated run:** the report is flagged as demo-only.
+- Warnings appear at the top of the report, and emailed reports get an `[INCOMPLETE]` or `[SIMULATED]` subject prefix.
+
+Older databases are migrated automatically. Each existing `scraped_at` becomes one run, assumed complete.
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Complete run, saved and reported |
+| 1 | No books scraped, nothing saved |
+| 2 | Incomplete run (`--max-pages` or a fetch failure), still saved and reported |
 
 ## Polite scraping
 
@@ -60,8 +82,8 @@ scraper/
   fetch.py    HTTP client: robots.txt, rate limiting, retries
   parse.py    BeautifulSoup: listing page -> book dicts + next-page link
   clean.py    pandas: prices to float, ratings to 1–5, dedupe
-  storage.py  SQLite upsert + history, CSV export
-  report.py   summary stats + diff vs previous run (text and HTML)
+  storage.py  SQLite runs, upsert + history, migration, CSV export
+  report.py   summary stats + diff vs last complete run (text and HTML)
   notify.py   SMTP email
 main.py       CLI that ties it all together
 ```
@@ -69,12 +91,17 @@ main.py       CLI that ties it all together
 ## Example queries
 
 ```sql
--- price history for one book
-SELECT scraped_at, price FROM price_history WHERE url LIKE '%a-light-in-the-attic%';
+-- price history for one book (real, complete runs only)
+SELECT r.started_at, h.price
+FROM price_history h JOIN runs r ON r.id = h.run_id
+WHERE h.url LIKE '%a-light-in-the-attic%' AND r.complete = 1 AND r.simulated = 0;
 
--- average price by rating (latest run)
+-- average price by rating (latest complete, non-simulated run)
 SELECT b.rating, ROUND(AVG(h.price), 2)
 FROM price_history h JOIN books b USING (url)
-WHERE h.scraped_at = (SELECT MAX(scraped_at) FROM price_history)
+WHERE h.run_id = (SELECT MAX(id) FROM runs WHERE complete = 1 AND simulated = 0)
 GROUP BY b.rating;
+
+-- all runs, newest first
+SELECT id, started_at, pages, books, complete, simulated, max_pages FROM runs ORDER BY id DESC;
 ```
